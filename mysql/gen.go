@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/iancoleman/strcase"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -43,8 +44,7 @@ func main() {
 	fmt.Fprintln(&buf)
 	fmt.Fprintln(&buf, "package mysql")
 	fmt.Fprintln(&buf)
-	// fmt.Fprintln(&buf, `import "image/color"`)
-	// fmt.Fprintln(&buf)
+	fmt.Fprintln(&buf, "const (")
 
 	ctx := context.Background()
 	pkg, err := loadPackage(ctx, ".")
@@ -61,10 +61,14 @@ func main() {
 		log.Fatal("failed to generate: ", err)
 	}
 
+	fmt.Fprintln(&buf)
+	fmt.Fprintln(&buf, ")")
+
 	data, err := format.Source(buf.Bytes())
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	err = os.WriteFile(*outputFilename, data, 0644)
 	if err != nil {
 		log.Fatal(err)
@@ -272,12 +276,20 @@ func parseScanArg(expr *ast.SelectorExpr) ScanArg {
 }
 
 func generate(buf *bytes.Buffer, parsed []ParsedScanFunc) error {
-	for i, p := range parsed {
-		var args string
+
+	for _, p := range parsed {
+		constName := p.FuncName + "Fields"
+		args := make([]string, 0, len(p.Args))
 		for _, arg := range p.Args {
-			args += fmt.Sprintf("%s.%s, ", arg.Path, arg.Name)
+			prefix, ok := p.Prefixes[arg.Path]
+			if !ok {
+				prefix = strings.Split(arg.Path, ".")[0]
+			}
+			name := strcase.ToSnake(arg.Name)
+			args = append(args, fmt.Sprintf("%s.%s", prefix, name))
 		}
-		fmt.Printf("%v) %s: %s - %+v\n\n", i, p.FuncName, args, p.Prefixes)
+
+		fmt.Fprintf(buf, "%s = %q\n", constName, strings.Join(args, ", "))
 	}
 	return nil
 }
