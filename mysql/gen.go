@@ -66,6 +66,7 @@ func main() {
 }
 
 type ParseOutput struct {
+	scanFuncs []*ast.FuncDecl
 }
 
 func loadPackage(ctx context.Context, dir string) (pkg *packages.Package, err error) {
@@ -100,22 +101,59 @@ func loadPackage(ctx context.Context, dir string) (pkg *packages.Package, err er
 	return nil, errors.New("package mysql not found")
 }
 
-func parsePackage(ctx context.Context, pkg *packages.Package) (out *ParseOutput, err error) {
+func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, error) {
+
+	scanFuncs := make([]*ast.FuncDecl, 100)
 	for i, file := range pkg.Syntax {
-		log.Default().Println(pkg.CompiledGoFiles[i], ":", "decl len (", len(file.Decls), ")")
+		_ = i
+		// log.Default().Println(pkg.CompiledGoFiles[i], ":", "decl len (", len(file.Decls), ")")
 
 		for _, decl := range file.Decls {
 			if fn, ok := decl.(*ast.FuncDecl); ok {
 				// Handle function declaration
 				if strings.HasPrefix(fn.Name.Name, "scan") {
-					log.Default().Println(fn.Name.Name)
+					scanFuncs = append(scanFuncs, fn)
+					for _, stmt := range fn.Body.List {
+						switch stmt := stmt.(type) {
+						// case *ast.DeclStmt:
+						// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.Decl)
+						// case *ast.ExprStmt:
+						// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.X)
+						case *ast.AssignStmt:
+							fmt.Printf("file: %s\n", pkg.CompiledGoFiles[i])
+							fmt.Printf("type: %T, position: %v\n", stmt, stmt.Pos())
+							fmt.Print("LHS: ")
+							for _, lhs := range stmt.Lhs {
+								fmt.Printf("%T - %v, ", lhs, lhs)
+							}
+							fmt.Println("\nRHS:")
+							for _, rhs := range stmt.Rhs {
+								callExpr, ok := rhs.(*ast.CallExpr)
+								if !ok {
+									continue
+								}
+								selectorExprScan, ok := callExpr.Fun.(*ast.SelectorExpr)
+								if !ok {
+									continue
+								}
+								fmt.Printf("FUNC: %v %v, args: %v\n", selectorExprScan.Sel.Name, callExpr.Fun, callExpr.Args)
+							}
+							// case *ast.ReturnStmt:
+							// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.Results)
+							// case *ast.ForStmt:
+							// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.Cond)
+							// default:
+							// 	fmt.Printf("type NOT HANDLED: %T, statement: %s\n", stmt, stmt)
+						}
+					}
 				}
 			}
 		}
-
 	}
 
-	return
+	return &ParseOutput{
+		scanFuncs: scanFuncs,
+	}, nil
 }
 
 func generate(buf *bytes.Buffer, parsed *ParseOutput) error {
