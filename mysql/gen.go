@@ -82,7 +82,7 @@ func loadPackage(ctx context.Context, dir string) (pkg *packages.Package, err er
 				strings.HasSuffix(filename, "_test.go"):
 				return parser.ParseFile(fset, filename, data, parser.PackageClauseOnly)
 			default:
-				return parser.ParseFile(fset, filename, data, parser.SkipObjectResolution|parser.AllErrors)
+				return parser.ParseFile(fset, filename, data, parser.ParseComments|parser.SkipObjectResolution|parser.AllErrors)
 			}
 
 		},
@@ -103,47 +103,69 @@ func loadPackage(ctx context.Context, dir string) (pkg *packages.Package, err er
 
 func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, error) {
 
-	scanFuncs := make([]*ast.FuncDecl, 100)
+	parseAssignmentStatement := func(stmt *ast.AssignStmt, cmap ast.CommentMap) bool {
+		for _, rhs := range stmt.Rhs {
+			callExpr, ok := rhs.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			selectorExprScan, ok := callExpr.Fun.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			if selectorExprScan.Sel.Name != "Scan" {
+				continue
+			}
+
+			// Found Scan method call!
+			fmt.Println("ARGS")
+			for _, arg := range callExpr.Args {
+				cgroup := cmap.Filter(arg)
+				if len(cgroup) != 0 {
+					fmt.Printf("Comment: %v", cgroup.String())
+				}
+				unaryExpl, ok := arg.(*ast.UnaryExpr)
+				if !ok {
+					fmt.Printf("DIFFERENT TYPE: %T %v\n", arg, arg)
+				}
+				fmt.Println(unaryExpl.X)
+				fmt.Println(unaryExpl.Op)
+				fmt.Println(unaryExpl.OpPos)
+			}
+
+		}
+		return true
+	}
+
 	for i, file := range pkg.Syntax {
 		_ = i
-		// log.Default().Println(pkg.CompiledGoFiles[i], ":", "decl len (", len(file.Decls), ")")
+		if len(file.Decls) == 0 {
+			// No need to load a comment map
+			continue
+		}
+
+		cmap := ast.NewCommentMap(pkg.Fset, file, file.Comments)
 
 		for _, decl := range file.Decls {
 			if fn, ok := decl.(*ast.FuncDecl); ok {
-				// Handle function declaration
+				// Find `func scan...` functions declared in the processed file
 				if strings.HasPrefix(fn.Name.Name, "scan") {
-					scanFuncs = append(scanFuncs, fn)
+					fmt.Println("----------- FUNCTION NAME ", fn.Name.Name)
+					// Found it! Now do through each statement inside the function body.
+					// Look for for lines like `err := s.Scan(`
+					// so an assignment, which right hand side is a call expression to `Scan`.
 					for _, stmt := range fn.Body.List {
 						switch stmt := stmt.(type) {
-						// case *ast.DeclStmt:
-						// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.Decl)
-						// case *ast.ExprStmt:
-						// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.X)
+						case *ast.ForStmt:
+							for _, stmt := range stmt.Body.List {
+								assignment, ok := stmt.(*ast.AssignStmt)
+								if !ok {
+									continue
+								}
+								parseAssignmentStatement(assignment, cmap)
+							}
 						case *ast.AssignStmt:
-							fmt.Printf("file: %s\n", pkg.CompiledGoFiles[i])
-							fmt.Printf("type: %T, position: %v\n", stmt, stmt.Pos())
-							fmt.Print("LHS: ")
-							for _, lhs := range stmt.Lhs {
-								fmt.Printf("%T - %v, ", lhs, lhs)
-							}
-							fmt.Println("\nRHS:")
-							for _, rhs := range stmt.Rhs {
-								callExpr, ok := rhs.(*ast.CallExpr)
-								if !ok {
-									continue
-								}
-								selectorExprScan, ok := callExpr.Fun.(*ast.SelectorExpr)
-								if !ok {
-									continue
-								}
-								fmt.Printf("FUNC: %v %v, args: %v\n", selectorExprScan.Sel.Name, callExpr.Fun, callExpr.Args)
-							}
-							// case *ast.ReturnStmt:
-							// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.Results)
-							// case *ast.ForStmt:
-							// 	fmt.Printf("type: %T, statement: %s\n", stmt, stmt.Cond)
-							// default:
-							// 	fmt.Printf("type NOT HANDLED: %T, statement: %s\n", stmt, stmt)
+							parseAssignmentStatement(stmt, cmap)
 						}
 					}
 				}
@@ -152,7 +174,7 @@ func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, err
 	}
 
 	return &ParseOutput{
-		scanFuncs: scanFuncs,
+		scanFuncs: nil,
 	}, nil
 }
 
