@@ -18,6 +18,7 @@ import (
 	"go/token"
 	"log"
 	"os"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -26,7 +27,8 @@ import (
 var outputFilename = flag.String("output", "sql_fields.go", "output file name")
 
 const (
-	skipComment = "sqlfieldgen:skip"
+	skipComment   = "sqlfieldgen:skip"
+	prefixComment = "sqlfieldgen:prefix="
 )
 
 func main() {
@@ -69,10 +71,6 @@ func main() {
 	}
 }
 
-type ParseOutput struct {
-	scanFuncs []*ast.FuncDecl
-}
-
 func loadPackage(ctx context.Context, dir string) (pkg *packages.Package, err error) {
 	parseMode := packages.NeedName | packages.NeedFiles | packages.NeedTypes | packages.NeedTypesInfo | packages.LoadAllSyntax
 	cfg := packages.Config{
@@ -105,56 +103,8 @@ func loadPackage(ctx context.Context, dir string) (pkg *packages.Package, err er
 	return nil, errors.New("package mysql not found")
 }
 
-func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, error) {
-
-	parseAssignmentStatement := func(stmt *ast.AssignStmt, cmap ast.CommentMap) bool {
-		for _, rhs := range stmt.Rhs {
-			callExpr, ok := rhs.(*ast.CallExpr)
-			if !ok {
-				continue
-			}
-			selectorExprScan, ok := callExpr.Fun.(*ast.SelectorExpr)
-			if !ok {
-				continue
-			}
-			if selectorExprScan.Sel.Name != "Scan" {
-				continue
-			}
-
-			// Found Scan method call!
-			fmt.Println("ARGS")
-			for _, arg := range callExpr.Args {
-
-				unaryExpl, ok := arg.(*ast.UnaryExpr)
-				if !ok {
-					fmt.Printf("DIFFERENT TYPE: %T %v\n", arg, arg)
-				}
-				// Check the comments to see if the rest of the fields should be skipped
-				comment := cmap.Filter(arg)
-				if len(comment) != 0 && strings.Contains(comment.String(), skipComment) {
-					fmt.Printf("skipping param %v %v\n", unaryExpl.X, unaryExpl.Op)
-					break
-				}
-
-				// Get the argument.
-				// If a field is simple variable, e.g. var count int,
-				// then the type is ast.SelectorExpr.
-				// If it's a struct member, it's a ast.SelectorExpr.
-				switch expr := unaryExpl.X.(type) {
-				case *ast.Ident:
-					fmt.Printf("simple var %v, %v, %v\n", expr.Name, expr.Obj, expr)
-				case *ast.SelectorExpr:
-					fmt.Printf("struct member %v, %v, %v\n", expr.Sel, expr.X, expr)
-				default:
-					log.Default().Printf("unknown argument type: %T\n", expr)
-				}
-
-			}
-
-		}
-		return true
-	}
-
+func parsePackage(ctx context.Context, pkg *packages.Package) ([]ParsedScanFunc, error) {
+	parsedScans := make([]ParsedScanFunc, 0)
 	for i, file := range pkg.Syntax {
 		_ = i
 		if len(file.Decls) == 0 {
@@ -168,7 +118,7 @@ func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, err
 			if fn, ok := decl.(*ast.FuncDecl); ok {
 				// Find `func scan...` functions declared in the processed file
 				if strings.HasPrefix(fn.Name.Name, "scan") {
-					fmt.Println("----------- FUNCTION NAME ", fn.Name.Name)
+
 					// Found it! Now do through each statement inside the function body.
 					// Look for for lines like `err := s.Scan(`
 					// so an assignment, which right hand side is a call expression to `Scan`.
@@ -180,10 +130,22 @@ func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, err
 								if !ok {
 									continue
 								}
-								parseAssignmentStatement(assignment, cmap)
+								scanFunctionCall, err := parseAssignmentStatement(assignment, fn, cmap)
+								if err != nil {
+									return nil, err
+								}
+								if scanFunctionCall != nil {
+									parsedScans = append(parsedScans, *scanFunctionCall)
+								}
 							}
 						case *ast.AssignStmt:
-							parseAssignmentStatement(stmt, cmap)
+							scanFunctionCall, err := parseAssignmentStatement(stmt, fn, cmap)
+							if err != nil {
+								return nil, err
+							}
+							if scanFunctionCall != nil {
+								parsedScans = append(parsedScans, *scanFunctionCall)
+							}
 						}
 					}
 				}
@@ -191,11 +153,131 @@ func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, err
 		}
 	}
 
-	return &ParseOutput{
-		scanFuncs: nil,
+	return parsedScans, nil
+}
+
+type ScanArg struct {
+	Name string
+	// Path represents all that stands before the field name,
+	// e.g. in object.Field.ScanDst, the path is object.Field
+	Path string
+	Expr ast.Expr
+}
+
+type ParsedScanFunc struct {
+	FuncName string
+	Args     []ScanArg
+	Prefixes map[string]string
+}
+
+func parseAssignmentStatement(stmt *ast.AssignStmt, fn *ast.FuncDecl, cmap ast.CommentMap) (*ParsedScanFunc, error) {
+
+	prefixes := make(map[string]string)
+	args := make([]ScanArg, 0)
+
+	for _, rhs := range stmt.Rhs {
+		callExpr, ok := rhs.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		selectorExprScan, ok := callExpr.Fun.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+		if selectorExprScan.Sel.Name != "Scan" {
+			continue
+		}
+
+		// Found Scan method call!
+		for _, arg := range callExpr.Args {
+
+			unaryExpl, ok := arg.(*ast.UnaryExpr)
+			if !ok {
+				return nil, fmt.Errorf("%s: unexpected argument type: %T %v", fn.Name.Name, arg, arg)
+			}
+
+			// Check the comments to see if the rest of the fields should be skipped
+			comment := cmap.Filter(arg)
+			if strings.Contains(comment.String(), skipComment) {
+				log.Default().Printf("%s: skipping param %v\n", fn.Name.Name, unaryExpl.X)
+				break
+			}
+
+			// Get the argument.
+			// If a field is simple variable, e.g. var count int,
+			// then the type is ast.SelectorExpr.
+			// If it's a struct member, it's a ast.SelectorExpr.
+			var scanArg ScanArg
+			switch expr := unaryExpl.X.(type) {
+			case *ast.Ident:
+				log.Default().Printf("%s: found var %q, use %q comment to exclude it from generation if needed\n", fn.Name.Name, expr.Name, skipComment)
+				scanArg = ScanArg{
+					Name: expr.Name,
+					Path: "",
+					Expr: expr,
+				}
+			case *ast.SelectorExpr:
+				scanArg = parseScanArg(expr)
+			default:
+				return nil, fmt.Errorf("%s: unknown argument type: %T %+v\n", fn.Name.Name, expr, expr)
+			}
+			args = append(args, scanArg)
+
+			if strings.Contains(comment.String(), prefixComment) {
+				parts := strings.Split(comment.String(), prefixComment)
+				if len(parts) != 2 {
+					return nil, fmt.Errorf("%s: unexpected comment format: %q, should be \"%s<value>\"\n", fn.Name.Name, comment.String(), prefixComment)
+				}
+
+				prefixes[scanArg.Path] = parts[1]
+			}
+		}
+	}
+
+	if len(args) == 0 {
+		return nil, nil
+	}
+
+	return &ParsedScanFunc{
+		FuncName: fn.Name.Name,
+		Args:     args,
+		Prefixes: prefixes,
 	}, nil
 }
 
-func generate(buf *bytes.Buffer, parsed *ParseOutput) error {
+func parseScanArg(expr *ast.SelectorExpr) ScanArg {
+	path := make([]string, 0)
+	var ptr *ast.SelectorExpr = expr
+
+	scanArg := ScanArg{
+		Name: expr.Sel.Name,
+		Expr: expr,
+	}
+
+	for {
+
+		switch inner := ptr.X.(type) {
+		case *ast.SelectorExpr:
+			path = append(path, inner.Sel.Name)
+			ptr = inner
+		case *ast.Ident:
+			path = append(path, inner.Name)
+			slices.Reverse(path)
+			scanArg.Path = strings.Join(path, ".")
+			return scanArg
+		default:
+			log.Fatalf("unexpected expr type: %T (%+v) included in expr %v\n", ptr.X, ptr.X, expr)
+		}
+	}
+}
+
+func generate(buf *bytes.Buffer, parsed []ParsedScanFunc) error {
+	for i, p := range parsed {
+		var args string
+		for _, arg := range p.Args {
+			args += fmt.Sprintf("%s.%s, ", arg.Path, arg.Name)
+		}
+		fmt.Printf("%v) %s: %s - %+v\n\n", i, p.FuncName, args, p.Prefixes)
+	}
 	return nil
 }
