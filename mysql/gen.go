@@ -25,6 +25,10 @@ import (
 
 var outputFilename = flag.String("output", "sql_fields.go", "output file name")
 
+const (
+	skipComment = "sqlfieldgen:skip"
+)
+
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("sql-fields-gen: ")
@@ -120,17 +124,31 @@ func parsePackage(ctx context.Context, pkg *packages.Package) (*ParseOutput, err
 			// Found Scan method call!
 			fmt.Println("ARGS")
 			for _, arg := range callExpr.Args {
-				cgroup := cmap.Filter(arg)
-				if len(cgroup) != 0 {
-					fmt.Printf("Comment: %v", cgroup.String())
-				}
+
 				unaryExpl, ok := arg.(*ast.UnaryExpr)
 				if !ok {
 					fmt.Printf("DIFFERENT TYPE: %T %v\n", arg, arg)
 				}
-				fmt.Println(unaryExpl.X)
-				fmt.Println(unaryExpl.Op)
-				fmt.Println(unaryExpl.OpPos)
+				// Check the comments to see if the rest of the fields should be skipped
+				comment := cmap.Filter(arg)
+				if len(comment) != 0 && strings.Contains(comment.String(), skipComment) {
+					fmt.Printf("skipping param %v %v\n", unaryExpl.X, unaryExpl.Op)
+					break
+				}
+
+				// Get the argument.
+				// If a field is simple variable, e.g. var count int,
+				// then the type is ast.SelectorExpr.
+				// If it's a struct member, it's a ast.SelectorExpr.
+				switch expr := unaryExpl.X.(type) {
+				case *ast.Ident:
+					fmt.Printf("simple var %v, %v, %v\n", expr.Name, expr.Obj, expr)
+				case *ast.SelectorExpr:
+					fmt.Printf("struct member %v, %v, %v\n", expr.Sel, expr.X, expr)
+				default:
+					log.Default().Printf("unknown argument type: %T\n", expr)
+				}
+
 			}
 
 		}
