@@ -129,6 +129,7 @@ func parsePackage(pkg *packages.Package) ([]ParsedScanFunc, error) {
 		}
 
 		cmap := ast.NewCommentMap(pkg.Fset, file, file.Comments)
+		errs := make([]error, 0)
 
 		for _, decl := range file.Decls {
 			if fn, ok := decl.(*ast.FuncDecl); ok {
@@ -232,12 +233,15 @@ func parseScanInvocation(scanCall *ast.CallExpr, fn *ast.FuncDecl, cmap ast.Comm
 	// sql prefixes given in the comments
 	prefixes := make(map[string]string)
 
-	for _, arg := range scanCall.Args {
+	// In case of error, continue to collect all the possible errors at once.
+	errs := make([]error, 0)
+	for i, arg := range scanCall.Args {
 
 		// Each of the arguments should be a unary expression: a pointer to a variable
 		unaryExpl, ok := arg.(*ast.UnaryExpr)
 		if !ok {
-			return nil, fmt.Errorf("%s: unexpected argument type: %T %v", fn.Name.Name, arg, arg)
+			errs = append(errs, NewInvalidTypeErr(fmt.Sprintf("argument #%v", i), arg))
+			continue
 		}
 
 		// If a field is marked with a skip comment, we will stop here.
@@ -255,17 +259,27 @@ func parseScanInvocation(scanCall *ast.CallExpr, fn *ast.FuncDecl, cmap ast.Comm
 		var scanArg ScanArg
 		switch expr := unaryExpl.X.(type) {
 		case *ast.Ident:
-			log.Default().Printf("%s: found var %q, use %q comment to exclude it from generation if needed\n", fn.Name.Name, expr.Name, skipComment)
+			log.Default().Printf("%s: found var %q, use %q comment to exclude it from generation if needed\n",
+				fn.Name.Name, expr.Name, skipComment)
 			scanArg = ScanArg{
 				Name: expr.Name,
 				Path: "",
 				Expr: expr,
 			}
 		case *ast.SelectorExpr:
-			scanArg = parseScanArg(expr)
+			arg, err := parseScanArg(expr)
+			if err != nil {
+				// Continue parsing, we want to catch all errors at once
+				errs = append(errs, err)
+				continue
+			}
+
+			scanArg = arg
 		default:
-			return nil, fmt.Errorf("%s: unknown argument type: %T %+v\n", fn.Name.Name, expr, expr)
+			errs = append(errs, NewInvalidTypeErr(fmt.Sprintf("argument #%v", i), arg))
+			continue
 		}
+
 		args = append(args, scanArg)
 
 		// Check if there is a prefix comment.
@@ -273,11 +287,19 @@ func parseScanInvocation(scanCall *ast.CallExpr, fn *ast.FuncDecl, cmap ast.Comm
 		if strings.Contains(comment.String(), prefixComment) {
 			parts := strings.Split(comment.String(), prefixComment)
 			if len(parts) != 2 {
-				return nil, fmt.Errorf("%s: unexpected comment format: %q, should be \"%s<value>\"\n", fn.Name.Name, comment.String(), prefixComment)
+				errs = append(errs, NewInvalidCommentErr(fmt.Sprintf("argument #%v", i), comment.String()))
+				continue
 			}
 
 			// Assign the prefix. It will be used by all the fields with the same path.
 			prefixes[scanArg.Path] = parts[1]
+		}
+	}
+
+	if len(errs) > 0 {
+		return nil, ParseFunError{
+			Errs:         errs,
+			FunctionName: fn.Name.Name,
 		}
 	}
 
@@ -293,13 +315,68 @@ func parseScanInvocation(scanCall *ast.CallExpr, fn *ast.FuncDecl, cmap ast.Comm
 
 }
 
+type ParseFunError struct {
+	Errs         []error
+	FunctionName string
+}
+
+func (e ParseFunError) Error() string {
+	msg := fmt.Sprintf("error parsing function %q:\n", e.FunctionName)
+	for _, err := range e.Errs {
+		msg += err.Error() + "\n"
+	}
+	return msg
+}
+
+func NewInvalidTypeErr(argument string, value any) error {
+	return ParseArgError{
+		Argument: argument,
+		Value:    value,
+		Reason:   ReasonWrongType,
+	}
+}
+
+func NewInvalidCommentErr(argument string, comment string) error {
+	return ParseArgError{
+		Argument: argument,
+		Value:    comment,
+		Reason:   ReasonWrongComment,
+	}
+}
+
+const (
+	ReasonWrongType = iota
+	ReasonWrongComment
+)
+
+type ParseArgError struct {
+	Argument string
+	Value    any
+	Reason   int
+}
+
+func (e ParseArgError) Error() string {
+	switch e.Reason {
+	case ReasonWrongType:
+		return fmt.Sprintf("%s: wrong type %T of the expression (%+v); expected a pointer to a struct field or a pointer to a variable",
+			e.Argument, e.Value, e.Value)
+	case ReasonWrongComment:
+		return fmt.Sprintf("%s: unexpected comment format: %q, should be \"%s<value>\"\n",
+			e.Argument, e.Value, prefixComment)
+	default:
+		panic("invalid error reason given, fix me please")
+	}
+
+}
+
 // parseScanArg parses a single Scan argument that is a pointer to a member of a struct,
 // e.g. `&object.Field`.
-func parseScanArg(expr *ast.SelectorExpr) ScanArg {
+func parseScanArg(expr *ast.SelectorExpr) (ScanArg, error) {
 	path := make([]string, 0)
 
+	fieldName := expr.Sel.Name
 	scanArg := ScanArg{
-		Name: expr.Sel.Name,
+		Name: fieldName,
 		Expr: expr,
 	}
 
@@ -323,9 +400,9 @@ func parseScanArg(expr *ast.SelectorExpr) ScanArg {
 			// Reverse the path, because the last fragment is actually the first one we read.
 			slices.Reverse(path)
 			scanArg.Path = strings.Join(path, ".")
-			return scanArg
+			return scanArg, nil
 		default:
-			log.Fatalf("unexpected expr type: %T (%+v) included in expr %v\n", ptr.X, ptr.X, expr)
+			return ScanArg{}, NewInvalidTypeErr(fieldName, ptr.X)
 		}
 	}
 }
