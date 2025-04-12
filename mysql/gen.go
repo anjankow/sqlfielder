@@ -16,10 +16,10 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io"
 	"log"
 	"os"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/iancoleman/strcase"
@@ -123,6 +123,8 @@ func parsePackage(pkg *packages.Package) ([]ParsedScanFunc, []ParsedScanFuncErr)
 	parsedScans := make([]ParsedScanFunc, 0)
 	errs := make([]ParsedScanFuncErr, 0)
 
+	files := make(map[string]FileContent, len(pkg.Syntax))
+
 	for _, file := range pkg.Syntax {
 		if len(file.Decls) == 0 {
 			// No declarations, no need to load a comment map
@@ -136,7 +138,16 @@ func parsePackage(pkg *packages.Package) ([]ParsedScanFunc, []ParsedScanFuncErr)
 				// Find `func scan...` functions declared in every file
 				if strings.HasPrefix(fn.Name.Name, "scan") {
 
-					// Found it! Now do through each statement inside the function body.
+					// Found it!
+					// Read the file content if not already read
+					filePath := pkg.Fset.Position(file.Pos()).Filename
+					fileContent, err := readFile(file, filePath, files)
+					if err != nil {
+						// This is fatal
+						log.Panicf("failed to read a file %s/%s: %s", pkg.Dir, file.Name, err)
+					}
+
+					// Now do through each statement inside the function body.
 					// Look for for lines like `err := s.Scan(`
 					// so an assignment, which right hand side is a call expression to `Scan`.
 					for _, stmt := range fn.Body.List {
@@ -149,7 +160,7 @@ func parsePackage(pkg *packages.Package) ([]ParsedScanFunc, []ParsedScanFuncErr)
 								if !ok {
 									continue
 								}
-								scanFunctionCall, err := parseAssignmentStatement(assignment, fn, cmap)
+								scanFunctionCall, err := parseAssignmentStatement(assignment, fn, cmap, fileContent)
 								if err != nil {
 									errs = append(errs, *err)
 									continue
@@ -159,7 +170,7 @@ func parsePackage(pkg *packages.Package) ([]ParsedScanFunc, []ParsedScanFuncErr)
 								}
 							}
 						case *ast.AssignStmt:
-							scanFunctionCall, err := parseAssignmentStatement(stmt, fn, cmap)
+							scanFunctionCall, err := parseAssignmentStatement(stmt, fn, cmap, fileContent)
 							if err != nil {
 								errs = append(errs, *err)
 								continue
@@ -177,10 +188,35 @@ func parsePackage(pkg *packages.Package) ([]ParsedScanFunc, []ParsedScanFuncErr)
 	return parsedScans, errs
 }
 
+type FileContent struct {
+	Content io.ReaderAt
+	BasePos int
+}
+
+func readFile(file *ast.File, filePath string, files map[string]FileContent) (FileContent, error) {
+	if reader, ok := files[filePath]; ok {
+		return reader, nil
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return FileContent{}, err
+	}
+
+	content := FileContent{
+		Content: f,
+		BasePos: int(file.FileStart),
+	}
+
+	files[filePath] = content
+
+	return content, nil
+}
+
 // parseAssignmentStatement parses assignment statement, like `a = b`,
 // searching for Scan method calls, so assignments like `res := s.Scan(...)`.
 // If such assignment is found, it parses it, getting the arguments and corresponding prefixes.
-func parseAssignmentStatement(stmt *ast.AssignStmt, fn *ast.FuncDecl, cmap ast.CommentMap) (*ParsedScanFunc, *ParsedScanFuncErr) {
+func parseAssignmentStatement(stmt *ast.AssignStmt, fn *ast.FuncDecl, cmap ast.CommentMap, fileContent FileContent) (*ParsedScanFunc, *ParsedScanFuncErr) {
 
 	for _, rhs := range stmt.Rhs {
 		callExpr, ok := rhs.(*ast.CallExpr)
@@ -197,7 +233,7 @@ func parseAssignmentStatement(stmt *ast.AssignStmt, fn *ast.FuncDecl, cmap ast.C
 
 		// Found Scan method call!
 		// There should be only one in a single scan... function.
-		scanFunc, err := parseScanInvocation(callExpr, cmap, fn.Name.Name)
+		scanFunc, err := parseScanInvocation(callExpr, cmap, fn.Name.Name, fileContent)
 		if err != nil {
 			return nil, &ParsedScanFuncErr{
 				FunctionName: fn.Name.Name,
@@ -212,8 +248,7 @@ func parseAssignmentStatement(stmt *ast.AssignStmt, fn *ast.FuncDecl, cmap ast.C
 
 // ScanArg is a single argument to a Scan function
 type ScanArg struct {
-	// Name is the name of the field, e.g. in object.Field.ScanDst, the name is ScanDst
-	Name string
+	NameWithPath string
 	// Path represents all that stands before the field name,
 	// e.g. in object.Field.ScanDst, the path is object.Field
 	Path string
@@ -221,8 +256,11 @@ type ScanArg struct {
 	Expr ast.Expr
 }
 
-func (a ScanArg) FullName() string {
-	return strings.Join([]string{a.Path, a.Name}, ".")
+func (arg ScanArg) FieldName() string {
+	if idx := strings.LastIndex(arg.NameWithPath, "."); idx > 0 {
+		return arg.NameWithPath[idx+1:]
+	}
+	return arg.NameWithPath
 }
 
 // ParsedScanFunc is the result of parsing a Scan function call
@@ -239,7 +277,7 @@ type ParsedScanFunc struct {
 }
 
 // parseScanInvocation parses a single `Scan` method invocation, gathering the arguments and corresponding prefixes.
-func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName string) (*ParsedScanFunc, []error) {
+func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName string, fileContent FileContent) (*ParsedScanFunc, []error) {
 	// `.Scan(` arguments
 	args := make([]ScanArg, 0)
 	// sql prefixes given in the comments
@@ -249,21 +287,22 @@ func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName s
 	errs := make([]error, 0)
 	for i, arg := range scanCall.Args {
 
-		scanArg, err := parseScanArgument(i, arg, funcName)
+		scanArg, err := parseArgument(arg, fileContent)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("arg#%d: %s", i, err))
 			// Continue parsing, we want to catch all errors at once
-			errs = append(errs, err)
 			continue
 		}
 
-		skip, err := parseArgComment(scanArg, arg, cmap, prefixes)
+		skip, err := parseArgComment(scanArg.Path, arg, cmap, prefixes)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("%q: %s", scanArg.NameWithPath, err))
+			// Continue parsing, we want to catch all errors at once
 			continue
 		}
 
 		if skip {
-			log.Default().Printf("%s: skipping %q\n", funcName, scanArg.FullName())
+			log.Default().Printf("%s: skipping %q\n", funcName, scanArg.NameWithPath)
 			continue
 		}
 
@@ -283,44 +322,35 @@ func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName s
 		Args:     args,
 		Prefixes: prefixes,
 	}, nil
-
 }
 
-func parseScanArgument(idx int, arg ast.Expr, funcName string) (ScanArg, error) {
-	// Each of the arguments should be a unary expression: a pointer to a variable
-	unaryExpl, ok := arg.(*ast.UnaryExpr)
-	if !ok {
-		return ScanArg{}, NewInvalidTypeErr(fmt.Sprintf("arg#%v", idx), arg)
+func parseArgument(arg ast.Expr, fileContent FileContent) (ScanArg, error) {
+	argLen := int(arg.End() - arg.Pos())
+	dst := make([]byte, argLen)
+
+	position := int(arg.Pos()) - fileContent.BasePos
+	n, err := fileContent.Content.ReadAt(dst, int64(position))
+	if err != nil {
+		return ScanArg{}, err
+	}
+	if n != argLen {
+		return ScanArg{}, fmt.Errorf("short read %d/%d", n, argLen)
 	}
 
-	// Get the argument.
-	// If a field is simple variable, e.g. var count int,
-	// then the type is ast.Ident.
-	// If it's a struct member, it's a ast.SelectorExpr.
-	var scanArg ScanArg
-	switch expr := unaryExpl.X.(type) {
-	case *ast.Ident:
-		log.Default().Printf("%s: use '// %s' to skip %q if needed\n",
-			funcName, skipComment, expr.Name)
-		scanArg = ScanArg{
-			Name: expr.Name,
-			Path: "",
-			Expr: expr,
-		}
-	case *ast.SelectorExpr:
-		arg, err := parseScanArg(expr)
-		if err != nil {
-			return ScanArg{}, err
-		}
-		scanArg = arg
-	default:
-		return ScanArg{}, NewInvalidTypeErr(fmt.Sprintf("arg#%v)", idx), arg)
+	argName := string(dst)
+	path := ""
+	if idx := strings.LastIndex(argName, "."); idx > 0 {
+		path = argName[:idx]
 	}
 
-	return scanArg, nil
+	return ScanArg{
+		NameWithPath: string(dst),
+		Path:         path,
+		Expr:         arg,
+	}, nil
 }
 
-func parseArgComment(scanArg ScanArg, arg ast.Expr, cmap ast.CommentMap, prefixes map[string]string) (skip bool, err error) {
+func parseArgComment(argPath string, arg ast.Expr, cmap ast.CommentMap, prefixes map[string]string) (skip bool, err error) {
 
 	// If a field is marked with a skip comment, we will stop here.
 	// Next arguments are not included in the list.
@@ -334,13 +364,13 @@ func parseArgComment(scanArg ScanArg, arg ast.Expr, cmap ast.CommentMap, prefixe
 	if strings.Contains(comment.String(), prefixComment) {
 		match := prefixCommentRegex.FindStringSubmatch(comment.String())
 		if len(match) != 2 {
-			return false, NewInvalidCommentErr(scanArg, comment.String())
+			return false, fmt.Errorf("unexpected comment format, should be \"%s<value>\"", prefixComment)
 		}
 
 		prefix := match[1]
 
 		// Assign the prefix. It will be used by all the fields with the same path.
-		prefixes[scanArg.Path] = prefix
+		prefixes[argPath] = prefix
 	}
 
 	return false, nil
@@ -349,86 +379,6 @@ func parseArgComment(scanArg ScanArg, arg ast.Expr, cmap ast.CommentMap, prefixe
 type ParsedScanFuncErr struct {
 	Errs         []error
 	FunctionName string
-}
-
-func NewInvalidTypeErr(argument string, value any) error {
-	return ParseArgError{
-		Argument: argument,
-		Value:    value,
-		Reason:   ReasonWrongType,
-	}
-}
-
-func NewInvalidCommentErr(scanArg ScanArg, comment string) error {
-	return ParseArgError{
-		Argument: scanArg.FullName(),
-		Value:    comment,
-		Reason:   ReasonWrongComment,
-	}
-}
-
-const (
-	ReasonWrongType = iota
-	ReasonWrongComment
-)
-
-type ParseArgError struct {
-	Argument string
-	Value    any
-	Reason   int
-}
-
-func (e ParseArgError) Error() string {
-	switch e.Reason {
-	case ReasonWrongType:
-		err := fmt.Sprintf("%q: wrong type %T of the expression (%+v); expected a pointer to a struct field or a pointer to a variable",
-			e.Argument, e.Value, e.Value)
-		return err
-	case ReasonWrongComment:
-		return fmt.Sprintf("%q: unexpected comment format, should be \"%s<value>\"",
-			e.Argument, prefixComment)
-	default:
-		panic("invalid error reason given, fix me please")
-	}
-
-}
-
-// parseScanArg parses a single Scan argument that is a pointer to a member of a struct,
-// e.g. `&object.Field`.
-func parseScanArg(expr *ast.SelectorExpr) (ScanArg, error) {
-	path := make([]string, 0)
-
-	fieldName := expr.Sel.Name
-	scanArg := ScanArg{
-		Name: fieldName,
-		Expr: expr,
-	}
-
-	// Use pointer to traverse the nested SelectorExpressions.
-	var ptr *ast.SelectorExpr = expr
-
-	// Parse the path - e.g. in &object.Field1.Field2.Field3,
-	// the path is object.Field1.Field2 and the name is Field3
-	for {
-
-		switch inner := ptr.X.(type) {
-		case *ast.SelectorExpr:
-			path = append(path, inner.Sel.Name)
-			// Move the pointer to the inner SelectorExpr
-			ptr = inner
-		case *ast.Ident:
-			// If it's a ast.Ident, we reached the final path fragment.
-			// In the example &object.Field1.Field2.Field3,
-			// the final fragment is `object`.
-			path = append(path, inner.Name)
-			// Reverse the path, because the last fragment is actually the first one we read.
-			slices.Reverse(path)
-			scanArg.Path = strings.Join(path, ".")
-			return scanArg, nil
-		default:
-			return ScanArg{}, NewInvalidTypeErr(fieldName, ptr.X)
-		}
-	}
 }
 
 // generate writes string constants for each `Scan` function
@@ -452,7 +402,7 @@ func generate(parsed []ParsedScanFunc, errs []ParsedScanFuncErr) (bytes.Buffer, 
 			if !ok {
 				prefix = strings.Split(arg.Path, ".")[0]
 			}
-			name := strcase.ToSnake(arg.Name)
+			name := strcase.ToSnake(arg.FieldName())
 			args = append(args, fmt.Sprintf("%s.%s", prefix, name))
 		}
 
