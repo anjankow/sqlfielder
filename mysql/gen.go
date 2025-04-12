@@ -37,7 +37,7 @@ const (
 )
 
 var (
-	prefixCommentRegex = regexp.MustCompile(fmt.Sprintf("%s([^\\s]+)$", prefixComment))
+	prefixCommentRegex = regexp.MustCompile(fmt.Sprintf("%s(\\S+)", prefixComment))
 )
 
 func main() {
@@ -197,7 +197,14 @@ func parseAssignmentStatement(stmt *ast.AssignStmt, fn *ast.FuncDecl, cmap ast.C
 
 		// Found Scan method call!
 		// There should be only one in a single scan... function.
-		return parseScanInvocation(callExpr, fn, cmap)
+		scanFunc, err := parseScanInvocation(callExpr, cmap, fn.Name.Name)
+		if err != nil {
+			return nil, &ParsedScanFuncErr{
+				FunctionName: fn.Name.Name,
+				Errs:         err,
+			}
+		}
+		return scanFunc, nil
 	}
 
 	return nil, nil
@@ -214,6 +221,10 @@ type ScanArg struct {
 	Expr ast.Expr
 }
 
+func (a ScanArg) FullName() string {
+	return strings.Join([]string{a.Path, a.Name}, ".")
+}
+
 // ParsedScanFunc is the result of parsing a Scan function call
 type ParsedScanFunc struct {
 	// FuncName is the name of the function calling Scan method.
@@ -228,7 +239,7 @@ type ParsedScanFunc struct {
 }
 
 // parseScanInvocation parses a single `Scan` method invocation, gathering the arguments and corresponding prefixes.
-func parseScanInvocation(scanCall *ast.CallExpr, fn *ast.FuncDecl, cmap ast.CommentMap) (*ParsedScanFunc, *ParsedScanFuncErr) {
+func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName string) (*ParsedScanFunc, []error) {
 	// `.Scan(` arguments
 	args := make([]ScanArg, 0)
 	// sql prefixes given in the comments
@@ -238,88 +249,101 @@ func parseScanInvocation(scanCall *ast.CallExpr, fn *ast.FuncDecl, cmap ast.Comm
 	errs := make([]error, 0)
 	for i, arg := range scanCall.Args {
 
-		// Each of the arguments should be a unary expression: a pointer to a variable
-		unaryExpl, ok := arg.(*ast.UnaryExpr)
-		if !ok {
-			errs = append(errs, NewInvalidTypeErr(fmt.Sprintf("arg#%v", i), arg))
+		scanArg, err := parseScanArgument(i, arg, funcName)
+		if err != nil {
+			// Continue parsing, we want to catch all errors at once
+			errs = append(errs, err)
 			continue
 		}
 
-		// If a field is marked with a skip comment, we will stop here.
-		// Next arguments are not included in the list.
-		comment := cmap.Filter(arg)
-		if strings.Contains(comment.String(), skipComment) {
-			log.Default().Printf("%s: skipping param %v\n", fn.Name.Name, unaryExpl.X)
-			break
-		}
-
-		// Get the argument.
-		// If a field is simple variable, e.g. var count int,
-		// then the type is ast.Ident.
-		// If it's a struct member, it's a ast.SelectorExpr.
-		var scanArg ScanArg
-		switch expr := unaryExpl.X.(type) {
-		case *ast.Ident:
-			log.Default().Printf("%s: use '// %s' to skip %q if needed\n",
-				fn.Name.Name, skipComment, expr.Name)
-			scanArg = ScanArg{
-				Name: expr.Name,
-				Path: "",
-				Expr: expr,
-			}
-		case *ast.SelectorExpr:
-			arg, err := parseScanArg(expr)
-			if err != nil {
-				// Continue parsing, we want to catch all errors at once
-				errs = append(errs, err)
-				continue
-			}
-
-			scanArg = arg
-		default:
-			errs = append(errs, NewInvalidTypeErr(fmt.Sprintf("arg#%v)", i), arg))
+		skip, err := parseArgComment(scanArg, arg, cmap, prefixes)
+		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
 
-		// Check if there is a prefix comment.
-		// The prefix is a string before the column name in a sql query.
-		if strings.Contains(comment.String(), prefixComment) {
-			match := prefixCommentRegex.FindStringSubmatch(comment.String())
-			if len(match) != 2 {
-				errs = append(errs, NewInvalidCommentErr(scanArg, comment.String()))
-				continue
-			}
-
-			prefix := match[1]
-			fmt.Println(prefix)
-
-			// Assign the prefix. It will be used by all the fields with the same path.
-			prefixes[scanArg.Path] = prefix
+		if skip {
+			log.Default().Printf("%s: skipping %q\n", funcName, scanArg.FullName())
+			continue
 		}
 
 		args = append(args, scanArg)
 	}
 
 	if len(errs) > 0 {
-		return &ParsedScanFunc{}, &ParsedScanFuncErr{
-			Errs:         errs,
-			FunctionName: fn.Name.Name,
-		}
+		return &ParsedScanFunc{}, errs
 	}
 
 	if len(args) == 0 {
-		return nil, &ParsedScanFuncErr{
-			Errs:         []error{fmt.Errorf("%s: no Scan arguments found", fn.Name.Name)},
-			FunctionName: fn.Name.Name,
-		}
+		return nil, []error{fmt.Errorf("%s: no Scan arguments found", funcName)}
 	}
 
 	return &ParsedScanFunc{
-		FuncName: fn.Name.Name,
+		FuncName: funcName,
 		Args:     args,
 		Prefixes: prefixes,
 	}, nil
 
+}
+
+func parseScanArgument(idx int, arg ast.Expr, funcName string) (ScanArg, error) {
+	// Each of the arguments should be a unary expression: a pointer to a variable
+	unaryExpl, ok := arg.(*ast.UnaryExpr)
+	if !ok {
+		return ScanArg{}, NewInvalidTypeErr(fmt.Sprintf("arg#%v", idx), arg)
+	}
+
+	// Get the argument.
+	// If a field is simple variable, e.g. var count int,
+	// then the type is ast.Ident.
+	// If it's a struct member, it's a ast.SelectorExpr.
+	var scanArg ScanArg
+	switch expr := unaryExpl.X.(type) {
+	case *ast.Ident:
+		log.Default().Printf("%s: use '// %s' to skip %q if needed\n",
+			funcName, skipComment, expr.Name)
+		scanArg = ScanArg{
+			Name: expr.Name,
+			Path: "",
+			Expr: expr,
+		}
+	case *ast.SelectorExpr:
+		arg, err := parseScanArg(expr)
+		if err != nil {
+			return ScanArg{}, err
+		}
+		scanArg = arg
+	default:
+		return ScanArg{}, NewInvalidTypeErr(fmt.Sprintf("arg#%v)", idx), arg)
+	}
+
+	return scanArg, nil
+}
+
+func parseArgComment(scanArg ScanArg, arg ast.Expr, cmap ast.CommentMap, prefixes map[string]string) (skip bool, err error) {
+
+	// If a field is marked with a skip comment, we will stop here.
+	// Next arguments are not included in the list.
+	comment := cmap.Filter(arg)
+	if strings.Contains(comment.String(), skipComment) {
+		return true, nil
+	}
+
+	// Check if there is a prefix comment.
+	// The prefix is a string before the column name in a sql query.
+	if strings.Contains(comment.String(), prefixComment) {
+		match := prefixCommentRegex.FindStringSubmatch(comment.String())
+		if len(match) != 2 {
+			return false, NewInvalidCommentErr(scanArg, comment.String())
+		}
+
+		prefix := match[1]
+
+		// Assign the prefix. It will be used by all the fields with the same path.
+		prefixes[scanArg.Path] = prefix
+	}
+
+	return false, nil
 }
 
 type ParsedScanFuncErr struct {
@@ -337,7 +361,7 @@ func NewInvalidTypeErr(argument string, value any) error {
 
 func NewInvalidCommentErr(scanArg ScanArg, comment string) error {
 	return ParseArgError{
-		Argument: strings.Join([]string{scanArg.Path, scanArg.Name}, "."),
+		Argument: scanArg.FullName(),
 		Value:    comment,
 		Reason:   ReasonWrongComment,
 	}
