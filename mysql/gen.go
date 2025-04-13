@@ -281,24 +281,36 @@ func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName s
 	// `.Scan(` arguments
 	args := make([]ScanArg, 0)
 	// sql prefixes given in the comments
-	prefixes := make(map[string]string)
+	prefixes := make(map[string] /*path*/ string /*prefix*/)
+	prefixes[""] = "" // use no prefix if not needed
+
+	missingPathPrefixes := make(map[string]bool)
 
 	// In case of error, continue to collect all the possible errors at once.
 	errs := make([]error, 0)
 	for i, arg := range scanCall.Args {
 
+		// First parse it
 		scanArg, err := parseArgument(arg, fileContent)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("arg#%d: %s", i, err))
-			// Continue parsing, we want to catch all errors at once
+			// Continue parsing other args, we want to catch all errors at once
 			continue
 		}
 
-		skip, err := parseArgComment(scanArg.Path, arg, cmap, prefixes)
+		// Check if there's any relevant comment given
+		skip, commentPrefix, err := parseArgComment(arg, cmap)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%q: %s", scanArg.NameWithPath, err))
-			// Continue parsing, we want to catch all errors at once
+			// Continue parsing other args, we want to catch all errors at once
 			continue
+		}
+
+		// Check if there is a prefix for this path.
+		// If none is found, it might be given for a next argument.
+		// For now, just mark it as missing.
+		if !validatePrefix(scanArg, prefixes, commentPrefix) {
+			missingPathPrefixes[scanArg.Path] = true
 		}
 
 		if skip {
@@ -307,6 +319,13 @@ func parseScanInvocation(scanCall *ast.CallExpr, cmap ast.CommentMap, funcName s
 		}
 
 		args = append(args, scanArg)
+	}
+
+	// Check if some prefixes are still missing
+	for path := range missingPathPrefixes {
+		if _, ok := prefixes[path]; !ok {
+			errs = append(errs, fmt.Errorf("%q: needed prefix", path))
+		}
 	}
 
 	if len(errs) > 0 {
@@ -345,18 +364,18 @@ func parseArgument(arg ast.Expr, fileContent FileContent) (ScanArg, error) {
 
 	return ScanArg{
 		NameWithPath: string(dst),
-		Path:         path,
+		Path:         strings.TrimPrefix(path, "&"),
 		Expr:         arg,
 	}, nil
 }
 
-func parseArgComment(argPath string, arg ast.Expr, cmap ast.CommentMap, prefixes map[string]string) (skip bool, err error) {
+func parseArgComment(arg ast.Expr, cmap ast.CommentMap) (skip bool, prefix string, err error) {
 
 	// If a field is marked with a skip comment, we will stop here.
 	// Next arguments are not included in the list.
 	comment := cmap.Filter(arg)
 	if strings.Contains(comment.String(), skipComment) {
-		return true, nil
+		skip = true
 	}
 
 	// Check if there is a prefix comment.
@@ -364,16 +383,41 @@ func parseArgComment(argPath string, arg ast.Expr, cmap ast.CommentMap, prefixes
 	if strings.Contains(comment.String(), prefixComment) {
 		match := prefixCommentRegex.FindStringSubmatch(comment.String())
 		if len(match) != 2 {
-			return false, fmt.Errorf("unexpected comment format, should be \"%s<value>\"", prefixComment)
+			err = fmt.Errorf("unexpected comment format, should be \"%s<value>\"", prefixComment)
+			return
 		}
 
-		prefix := match[1]
+		prefix = match[1]
+	}
+	return
+}
 
-		// Assign the prefix. It will be used by all the fields with the same path.
-		prefixes[argPath] = prefix
+// validatePrefix for this path. It returns true if a SQL prefix exists.
+// 1. If prefix is given explicitly in the comment, it's saved in prefixes map.
+// 2. If the  path is possible to use it as a prefix, it's saved in prefixes map.
+func validatePrefix(scanArg ScanArg, prefixes map[string]string, commentPrefix string) bool {
+	if commentPrefix != "" {
+		// If prefix is given explicitly, save it in prefixes map
+		// overrwiting any existing prefix.
+		// Explicit prefix always takes precedence.
+		prefixes[scanArg.Path] = commentPrefix
+		return true
 	}
 
-	return false, nil
+	if _, prefixExists := prefixes[scanArg.Path]; prefixExists {
+		// There already is a prefix associated with this path
+		return true
+	}
+
+	// No prefix given, use the argument path if consists of one part only
+	// (e.g. an argument is given as &a.Field)
+	if !strings.ContainsRune(scanArg.Path, '.') {
+		prefixes[scanArg.Path] = scanArg.Path
+		return true
+	}
+
+	// If there is more than one part, we need to have a prefix given.
+	return false
 }
 
 type ParsedScanFuncErr struct {
