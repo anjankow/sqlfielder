@@ -53,14 +53,14 @@ var (
 // Comments that can be used next to the Scan function arguments
 const (
 	// skipComment is used to skip this and the following arguments
-	skipComment = "sqlfieldgen:skip"
+	skipComment = "sqlfielder:skip"
 	// prefixComment is used to indicate the SELECT query prefix of a given argument
-	prefixComment = "sqlfieldgen:prefix="
+	prefixComment = "sqlfielder:prefix="
 )
 
 func main() {
 	log.SetFlags(0)
-	log.SetPrefix("sql-fielder: ")
+	log.SetPrefix("sqlfielder: ")
 
 	flag.Parse()
 	if packageName == nil || *packageName == "" {

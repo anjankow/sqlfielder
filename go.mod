@@ -1,4 +1,4 @@
-module github.com/anjankow/sql-fielder
+module github.com/anjankow/sqlfielder
 
 go 1.24.0
 
